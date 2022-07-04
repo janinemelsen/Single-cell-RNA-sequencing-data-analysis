@@ -1,0 +1,352 @@
+---
+title: "Integration Yang Crinier Melsen"
+output: html_document
+---
+
+## library
+````{r setup, include=FALSE, warning=FALSE, message=FALSE, error=FALSE}
+library(scater)
+library(scran)
+library(SingleR)
+library(EnsDb.Hsapiens.v86)
+library(batchelor)
+library(BiocParallel)
+library(BiocNeighbors)
+library(pheatmap)
+library(reshape2)
+```
+
+## import required objects
+
+```{r}
+sce <- readRDS('sce_clustered.rds')
+sce.dim <- readRDS('sce_dim.rds')
+
+# add sublabels to sce opbject
+sce.dim$sublabel <- paste('CD56dimGZMKmin',sep="_",sce.dim$sublabel)
+sce$sublabel <- sce$subset
+sce[,sce$label=='1']$sublabel <- sce.dim$sublabel
+```
+
+
+## import Yang and Crinier dataset (not corrected for sequencing depth yet)
+
+see script 'Yang integration' and 'Crinier integration'
+
+```{r}
+Yang_filtered <- readRDS("Yang_filtered.rds")
+Crinier_filtered <- readRDS("Crinier_filtered.rds")
+
+#remove non-NK cells
+Yang_filtered <- Yang_filtered[, Yang_filtered$label%in%c('2','6','7','8','9','12','13','14','15','16','17')]
+Crinier_filtered <- Crinier_filtered[,Crinier_filtered$label%in%c('1','2','3','4','5','6','8','10','11')]
+sce <- sce[, sce$label%in%c('1','2','4','6','7','8')]
+
+
+#merge datasets
+sce$Dataset <- 'Melsen'
+Yang_filtered$Dataset <- 'Yang'
+Crinier_filtered$Dataset <- 'Crinier'
+Yang_filtered$sublabel <- Yang_filtered$label
+Crinier_filtered$sublabel <- Crinier_filtered$label
+
+
+colData(Yang_filtered) <- colData(Yang_filtered)[, c("Barcode", "sum", "detected", "Donor", "subsets_Mito_percent", "subsets_Ribo_percent", "label", "Dataset", "sizeFactor", "sublabel")]
+colData(Crinier_filtered) <- colData(Crinier_filtered)[, c("Barcode", "sum", "detected", "Donor", "subsets_Mito_percent", "subsets_Ribo_percent", "label", "Dataset", "sizeFactor", "sublabel")]
+colData(sce) <- colData(sce)[, c("Barcode", "sum", "detected", "Donor", "subsets_Mito_percent", "subsets_Ribo_percent", "label", "Dataset", "sizeFactor", "sublabel")]
+
+reducedDims(sce) <- NULL
+reducedDims(Yang_filtered) <- NULL
+reducedDims(Crinier_filtered) <- NULL
+altExps(sce) <- NULL
+rowData(sce) <- NULL
+rowData(Yang_filtered) <- NULL
+rowData(Crinier_filtered) <- NULL
+
+NK_merged <- cbind(sce, Yang_filtered, deparse.level=1)
+NK_merged <- cbind(NK_merged, Crinier_filtered, deparse.level=1)
+```
+
+
+## Data integration with correction for sequencing depth
+
+```{r message=FALSE, error=FALSE}
+
+rescaled.NK_merged <- multiBatchNorm(NK_merged, batch = NK_merged$Donor, BPPARAM=SnowParam(workers=19))
+rescaled.NK_merged$Dataset_Donor <- paste(rescaled.NK_merged$Dataset, sep="_", rescaled.NK_merged$Donor)
+
+#variable genes
+dec<- modelGeneVar(rescaled.NK_merged, block=rescaled.NK_merged$Dataset_Donor, BPPARAM=SnowParam(workers=19))
+hvg.sce.var <- getTopHVGs(dec, n=2000)
+
+set.seed(1000101001)
+
+#try to improve integration by increasing k (standard =20)
+merged.corrected.NK_merged <- fastMNN(rescaled.NK_merged, batch=rescaled.NK_merged$Dataset_Donor, d=50, k=20, subset.row=hvg.sce.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.NK_merged,'MNN') <- reducedDim(merged.corrected.NK_merged, 'corrected')
+```
+
+## Dimensionality reduction
+
+```{r}
+set.seed(01010100)
+rescaled.NK_merged <- runUMAP(rescaled.NK_merged, dimred="MNN",
+    external_neighbors=TRUE, 
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6,
+    name='UMAP'
+    )
+```
+
+## clustering
+Graph-based clustering generates an excessively large intermediate graph so we will instead use a two-step approach with k-means. We generate 8000 small clusters that are subsequently aggregated into more interpretable groups with a graph-based method.
+```{r}
+#either use kmeans clustering to speed up the process
+clust.NK_merged <- clusterSNNGraph(rescaled.NK_merged, use.dimred="MNN", 
+    use.kmeans=TRUE, kmeans.centers=8000, clusterFUN=igraph::cluster_walktrap)
+
+# we choose kmeans clustering based on SNN graph
+rescaled.NK_merged$cluster <- factor(clust.NK_merged)
+```
+
+
+## Visualization
+```{r}
+plotUMAP(rescaled.NK_merged, colour_by='cluster', text_by='cluster')
+plotUMAP(rescaled.NK_merged, colour_by='Dataset_Donor', text_by='Dataset_Donor')
+plotUMAP(rescaled.NK_merged, colour_by='Dataset', text_by='Dataset')
+```
+
+
+## single R prediction based on label sce object
+
+# predict label based on sublabels sce object
+```{r}
+pred <- SingleR(test=rescaled.NK_merged, ref=sce, labels=sce$label, de.method = 'wilcox')
+pred.sub <- SingleR(test=rescaled.NK_merged, ref=sce, labels=sce$sublabel, de.method = 'wilcox')
+
+rescaled.NK_merged$reflabel_major <- pred$labels
+rescaled.NK_merged$reflabel_minor <- pred.sub$labels
+rescaled.NK_merged$score_major <- apply(pred$scores,1,max)
+rescaled.NK_merged$score_minor <- apply(pred.sub$scores,1,max)
+
+plotReducedDim(rescaled.NK_merged, "UMAP",  colour_by="reflabel_major")+
+scale_color_manual(values = c('1' = "#729ece", '2' = "#67bf5c", '4'='#ed665d', '6'='#ed97ca', '7'='#ff9e4a', '8'='#a2a2a2'),aesthetics = "fill")+ theme(text = element_text(size = 15), axis.text=element_text(size=15))
+
+plotReducedDim(rescaled.NK_merged[,rescaled.NK_merged$Dataset=='Melsen'], "UMAP",  colour_by="label")+
+scale_color_manual(values = c('1' = "#729ece", '2' = "#67bf5c", '4'='#ed665d', '6'='#ed97ca', '7'='#ff9e4a', '8'='#a2a2a2'),aesthetics = "fill")
+
+plotReducedDim(rescaled.NK_merged[,rescaled.NK_merged$Dataset=='Yang'], "UMAP",  colour_by="reflabel_major")+
+scale_color_manual(values = c('1' = "#729ece", '2' = "#67bf5c", '4'='#ed665d', '6'='#ed97ca', '7'='#ff9e4a', '8'='#a2a2a2'),aesthetics = "fill")
+
+plotReducedDim(rescaled.NK_merged[,rescaled.NK_merged$Dataset=='Crinier'], "UMAP",  colour_by="reflabel_major")+
+scale_color_manual(values = c('1' = "#729ece", '2' = "#67bf5c", '4'='#ed665d', '6'='#ed97ca', '7'='#ff9e4a', '8'='#a2a2a2'),aesthetics = "fill")
+
+
+plotReducedDim(rescaled.NK_merged, "UMAP",  colour_by="reflabel_minor")
+
+ggsave("refclusters_melsen.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 5,height = 4, units = c("in", "cm", "mm", "px"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL)
+
+table(rescaled.NK_merged$reflabel_major,rescaled.NK_merged$Dataset_Donor)
+table(sce$label)
+```
+
+
+save RDS
+```{r}
+saveRDS(rescaled.NK_merged, 'rescaled.NK_merged.rds')
+```
+
+## subcluster CD56bright
+```{r}
+rescaled.NK_merged.bright <- rescaled.NK_merged[,rescaled.NK_merged$reflabel_major %in% c('4')]
+
+#variable genes
+dec.bright<- modelGeneVar(rescaled.NK_merged.bright)
+hvg.rescaled.NK_merged.var <- getTopHVGs(dec.bright, n=2000)
+str(hvg.rescaled.NK_merged.var)
+
+merged.corrected.bright <- fastMNN(rescaled.NK_merged.bright, batch=rescaled.NK_merged.bright$Dataset_Donor, d=50, k=20, subset.row=hvg.rescaled.NK_merged.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.NK_merged.bright,'MNN') <- reducedDim(merged.corrected.bright, 'corrected')
+
+rescaled.NK_merged.bright <- runUMAP(rescaled.NK_merged.bright, dimred="MNN",
+    external_neighbors=TRUE, 
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6)
+
+g.major <- buildSNNGraph(rescaled.NK_merged.bright, k=11, use.dimred = 'MNN')
+clust.major <- igraph::cluster_infomap(g.major)$membership
+table(clust.major)
+colLabels(rescaled.NK_merged.bright) <- factor(clust.major)
+
+
+plotReducedDim(rescaled.NK_merged.bright,dimred="UMAP", colour_by ="KIT", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.bright,dimred="UMAP", colour_by ="CD27", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.bright,dimred="UMAP", colour_by ="FCGR3A", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+plotReducedDim(rescaled.NK_merged.bright,dimred="UMAP", colour_by ="CCL5", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+
+ggsave("CCL5_bright_merged.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 5,dpi = 300,limitsize = TRUE,bg = NULL,)
+
+
+saveRDS(rescaled.NK_merged.bright, 'merged_bright.rds')
+```
+
+##subcluster ltNK
+```{r}
+rescaled.NK_merged.ltnk <- rescaled.NK_merged[,rescaled.NK_merged$reflabel_major %in% c('2')]
+
+#variable genes
+dec.ltnk<- modelGeneVar(rescaled.NK_merged.ltnk)
+hvg.rescaled.NK_merged.var <- getTopHVGs(dec.ltnk, n=2000)
+str(hvg.rescaled.NK_merged.var)
+
+
+merged.corrected.ltnk <- fastMNN(rescaled.NK_merged.ltnk, batch=rescaled.NK_merged.ltnk$Dataset_Donor, d=50, k=20, subset.row=hvg.rescaled.NK_merged.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.NK_merged.ltnk,'MNN') <- reducedDim(merged.corrected.ltnk, 'corrected')
+
+rescaled.NK_merged.ltnk <- runUMAP(rescaled.NK_merged.ltnk, dimred="MNN",
+    external_neighbors=TRUE, 
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6)
+
+g.major <- buildSNNGraph(rescaled.NK_merged.ltnk, k=11, use.dimred = 'MNN')
+clust.major <- igraph::cluster_infomap(g.major)$membership
+table(clust.major)
+colLabels(rescaled.NK_merged.ltnk) <- factor(clust.major)
+
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="label", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="CD3D", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+#remove cluster 8 = T cells
+
+rescaled.NK_merged.ltnk <- rescaled.NK_merged.ltnk[, rescaled.NK_merged.ltnk$label != '8']
+
+rescaled.NK_merged.ltnk <- runUMAP(rescaled.NK_merged.ltnk, dimred="MNN",
+    external_neighbors=TRUE, 
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6)
+
+g.major <- buildSNNGraph(rescaled.NK_merged.ltnk, k=11, use.dimred = 'MNN')
+clust.major <- igraph::cluster_infomap(g.major)$membership
+table(clust.major)
+colLabels(rescaled.NK_merged.ltnk) <- factor(clust.major)
+
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="label", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="CD226", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="KLRC1", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="FCGR3A", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="CCL5", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="NFKBIA", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+plotReducedDim(rescaled.NK_merged.ltnk,dimred="UMAP", colour_by ="subsets_Ribo_percent", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+
+ggsave("label_ltnk.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 5,dpi = 300,limitsize = TRUE,bg = NULL,)
+
+
+markers<- findMarkers(rescaled.NK_merged.ltnk, test="wilcox", groups=rescaled.NK_merged.ltnk$label)
+cluster1<-as.data.frame(markers[[1]])
+cluster2<-as.data.frame(markers[[2]])
+cluster3<-as.data.frame(markers[[3]])
+cluster4<-as.data.frame(markers[[4]])
+cluster5<-as.data.frame(markers[[5]])
+cluster6<-as.data.frame(markers[[6]])
+cluster7<-as.data.frame(markers[[7]])
+
+#complete heatmap of top 5 most differentially expressed genes, Z-score
+top5=list()
+for (i in 1:length(markers)){
+  top5[[i]] <- rownames(markers[[i]])[markers[[i]]$Top<=5]
+}
+p <- plotDots(rescaled.NK_merged.ltnk, features=unique(unlist(top5)), group='label')
+p <- p$data[,c(1,2,4)]
+p2 <- dcast(p,Feature ~Group,  value.var='Average')
+row.names(p2) <- p2$Feature
+p2 <- p2[,-1]
+pheatmap(p2, scale="row", cluster_cols=FALSE, cluster_rows = TRUE, cellwidth=7, cellheight = 7, fontsize_row=7, fontsize_col=7)
+
+saveRDS(rescaled.NK_merged.ltnk, "merged_ltNK.rds")
+```
+
+## subcluster CD56dimGZMK+
+```{r}
+rescaled.NK_merged.dimgzmkplus <- rescaled.NK_merged[,rescaled.NK_merged$reflabel_major %in% c('7')]
+
+#variable genes
+dec.dimgzmkplus<- modelGeneVar(rescaled.NK_merged.dimgzmkplus)
+hvg.rescaled.NK_merged.var <- getTopHVGs(dec.dimgzmkplus, n=2000)
+str(hvg.rescaled.NK_merged.var)
+
+
+merged.corrected.dimgzmkplus <- fastMNN(rescaled.NK_merged.dimgzmkplus, batch=rescaled.NK_merged.dimgzmkplus$Dataset_Donor, d=50, k=20, subset.row=hvg.rescaled.NK_merged.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.NK_merged.dimgzmkplus,'MNN') <- reducedDim(merged.corrected.dimgzmkplus, 'corrected')
+
+rescaled.NK_merged.dimgzmkplus <- runUMAP(rescaled.NK_merged.dimgzmkplus, dimred="MNN",
+    external_neighbors=TRUE, 
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6)
+
+g.major <- buildSNNGraph(rescaled.NK_merged.dimgzmkplus, k=11, use.dimred = 'MNN')
+clust.major <- igraph::cluster_infomap(g.major)$membership
+table(clust.major)
+colLabels(rescaled.NK_merged.dimgzmkplus) <- factor(clust.major)
+
+plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="label", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+
+plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="GZMK", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="GZMB", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=17))
+plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="FGFBP2", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="CCL5", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="subsets_Ribo_percent", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
+
+ggsave("ribo_merged_dimkpluis.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 5,dpi = 300,limitsize = TRUE,bg = NULL,)
+
+
+markers<- findMarkers(rescaled.NK_merged.dimgzmkplus, test="wilcox", groups=rescaled.NK_merged.dimgzmkplus$label)
+cluster1<-as.data.frame(markers[[1]])
+cluster2<-as.data.frame(markers[[2]])
+cluster3<-as.data.frame(markers[[3]])
+cluster4<-as.data.frame(markers[[4]])
+
+#complete heatmap of top 5 most differentially expressed genes, Z-score
+top5=list()
+for (i in 1:length(markers)){
+  top5[[i]] <- rownames(markers[[i]])[markers[[i]]$Top<=5]
+}
+p <- plotDots(rescaled.NK_merged.dimgzmkplus, features=unique(unlist(top5)), group='label')
+p <- p$data[,c(1,2,4)]
+p2 <- dcast(p,Feature ~Group,  value.var='Average')
+row.names(p2) <- p2$Feature
+p2 <- p2[,-1]
+pheatmap(p2, scale="row", cluster_cols=FALSE, cluster_rows = TRUE, cellwidth=7, cellheight = 7, fontsize_row=7, fontsize_col=7)
+
+saveRDS(rescaled.NK_merged.ltnk, "merged_dimgzmkplus.rds")
+
+
+```
