@@ -1,0 +1,294 @@
+---
+title: "Yang_integration"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE, error=FALSE}
+library(scater)
+library(scran)
+library(SingleCellExperiment)
+library(EnsDb.Hsapiens.v86)
+library(batchelor)
+library(BiocNeighbors)
+library(BiocParallel)
+library(DropletUtils)
+library(reshape2)
+```
+
+## Import dataset
+```{r}
+Yang_unfiltered<- read10xCounts('P:/kjc/Immlab/janineM/Yang/AGGHD_BM_PB/outs/filtered_feature_bc_matrix.h5', type="HDF5")
+
+Yang_unfiltered$Donor <- gsub(pattern=".+-", replacement="", Yang_unfiltered$Barcode)
+
+rowData(Yang_unfiltered)$Chr <- mapIds(EnsDb.Hsapiens.v86, keys=rownames(Yang_unfiltered),
+    column="SEQNAME", keytype="GENEID")
+
+rownames(Yang_unfiltered) <- uniquifyFeatureNames(rowData(Yang_unfiltered)$ID,
+    names = rowData(Yang_unfiltered)$Symbol)
+```
+
+
+## Quality control
+```{r fig.width=24, fig.height=6}
+# add mitodata
+mito <- grep("^MT", rowData(Yang_unfiltered)$Symbol)
+Yang_unfiltered <- addPerCellQC(Yang_unfiltered, subsets=list(Mito=mito))
+colData(Yang_unfiltered)[, 1:5]
+
+Yang_unfiltered <- addPerFeatureQC(Yang_unfiltered)
+rowData(Yang_unfiltered)
+
+# add ribodata
+ribo <- grep("^RP[SL]", rowData(Yang_unfiltered)$Symbol)
+Yang_unfiltered <- addPerCellQC(Yang_unfiltered, subsets=list(Ribo=ribo))
+colData(Yang_unfiltered)
+
+df <- colData(Yang_unfiltered)
+qc.nexprs <- df$detected < 200 | df$detected >6000
+qc.ribo <- df$subsets_Ribo_percent < 10
+qc.mito <- df$subsets_Mito_percent > 10
+
+discard <- qc.nexprs | qc.ribo  | qc.mito
+Yang_unfiltered$discard <- discard
+
+
+# generate plots to highlight discarded cells
+gridExtra::grid.arrange(
+    plotColData(Yang_unfiltered, x='Donor', y="sum", colour_by="discard")+ scale_y_log10() + ggtitle("Total RNA")+ylab("Total RNA"),
+    plotColData(Yang_unfiltered, x='Donor', y="detected", colour_by="discard") + scale_y_log10() + ggtitle("Total genes") +ylab("Total genes"),
+    plotColData(Yang_unfiltered,x='Donor', y="subsets_Mito_percent", colour_by="discard") + ggtitle("% Mito")+ylab("% Mito"),
+    plotColData(Yang_unfiltered,y="subsets_Ribo_percent", colour_by="discard") + ggtitle("% Ribo")+ylab("% Mito"),
+    ncol=4
+)
+
+plotColData(Yang_unfiltered, x="sum", y="detected", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+ylab("total RNA")+xlab("Genes")
+
+plotColData(Yang_unfiltered, x="sum", y="subsets_Mito_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+xlab("total RNA")+ylab("% mito")
+
+plotColData(Yang_unfiltered, x="sum", y="subsets_Ribo_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+xlab("total RNA")+ylab("% ribo")
+
+plotColData(Yang_unfiltered, x="subsets_Mito_percent", y="subsets_Ribo_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+xlab("% mito")+ylab("% ribo")
+
+#remove discarded cells
+Yang_filtered <- Yang_unfiltered[,!Yang_unfiltered$discard]
+```
+
+## Normalization, log transformation
+```{r message=FALSE echo=FALSE error=FALSE}
+set.seed(1000)
+clusters <- quickCluster(Yang_filtered, BPPARAM=SnowParam(workers=4), block=Yang_filtered$Donor)
+table(clusters)
+
+#add deconv factor to sce
+Yang_filtered <- computeSumFactors(Yang_filtered, clusters=clusters, BPPARAM=SnowParam(workers=19))
+
+
+#We then compute log-normalized expression values for downstream use.
+Yang_filtered <- logNormCounts(Yang_filtered)
+```
+
+## save RDS
+```{r}
+saveRDS(Yang_filtered, 'Yang_filtered.rds')
+```
+
+
+## Data integration (with correction for sequencing depth)
+```{r message=FALSE, error=FALSE}
+# correction for sequencing depth (recalculation of size factors)
+rescaled.Yang <- multiBatchNorm(Yang_filtered, batch = Yang_filtered$Donor, BPPARAM=SnowParam(workers=19))
+
+#variable genes
+dec<- modelGeneVar(rescaled.Yang, block=rescaled.Yang$Donor, BPPARAM=SnowParam(workers=19))
+hvg.sce.var <- getTopHVGs(dec, n=2000)
+
+set.seed(1000101001)
+
+#try to improve integration by increasing k (standard =20)
+merged.corrected.Yang <- fastMNN(rescaled.Yang, batch=rescaled.Yang$Donor, d=50, k=20, subset.row=hvg.sce.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.Yang,'MNN') <- reducedDim(merged.corrected.Yang, 'corrected')
+```
+
+
+## Dimensionality reduction
+```{r}
+set.seed(01010100)
+rescaled.Yang <- runUMAP(rescaled.Yang, dimred="MNN",
+    external_neighbors=TRUE,
+    n_neighbors=30,
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6,
+    name='UMAP'
+    )
+```
+
+
+## clustering
+Graph-based clustering generates an excessively large intermediate graph so we will instead use a two-step approach with k-means. We generate 8000 small clusters that are subsequently aggregated into more interpretable groups with a graph-based method.
+```{r}
+#either use kmeans clustering to speed up the process
+clust.Yang <- clusterSNNGraph(rescaled.Yang, use.dimred="MNN", 
+    use.kmeans=TRUE, kmeans.centers=8000, clusterFUN=igraph::cluster_walktrap)
+
+# we choose kmeans clustering based on SNN graph
+colLabels(rescaled.Yang) <- factor(clust.Yang)
+table(colLabels(rescaled.Yang))
+table(Cluster=clust.Yang, Batch=rescaled.Yang$Donor)
+
+rescaled.Yang$source <- rescaled.Yang$Donor
+rescaled.Yang$source <- gsub('1', 'BM', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('2', 'BM', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('3', 'BM', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('4', 'BM', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('5', 'BM', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('6', 'BM', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('7', 'PB', rescaled.Yang$source)
+rescaled.Yang$source <- gsub('8', 'PB', rescaled.Yang$source)
+
+rescaled.Yang$Sample <- rescaled.Yang$Donor
+rescaled.Yang$Sample <- gsub('1$', '24y_F_BM', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('2$', '25y_F_1_BM', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('3$', '25y_F_2_BM', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('4$', '26y_F_BM', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('5$', '25y_M_BM', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('6$', '35y_M_BM', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('7$', '25y_F_2_PB', rescaled.Yang$Sample)
+rescaled.Yang$Sample <- gsub('8$', '26y_F_PB', rescaled.Yang$Sample)
+
+```
+
+
+## Visualization
+```{r}
+plotUMAP(rescaled.Yang, colour_by='label', text_by='label') +
+scale_color_manual(values = c('6'='#ff9e4a','17'= '#ed97ca','14'= "#729ece",'2'="#ad8bc9", '10'= '#C49C49','7'="#67bf5c", '1'= '#a8786e',   '16' ='#17becf', '13'= '#ED665D', '3'='#98DF8A','11'= '#7F7F7F',  '4'='#DBDB8D', '5'='#FF9896', '8'='#bcbd22' , '9'='#aec7e8', '15'='#499894', '12'= '#c7c7c7' ),aesthetics = "fill")
+
+ggsave("Yang_cluster.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 5,height = 4, dpi =300,limitsize = TRUE,bg = NULL,)
+
+plotUMAP(rescaled.Yang, colour_by='Donor', text_by='Donor')
+plotUMAP(rescaled.Yang, colour_by='source', text_by='source')
+```
+## upregulated markers
+```{r}
+markers_up<- findMarkers(rescaled.Yang, test="wilcox", direction='up')
+cluster1<-as.data.frame(markers_up[[1]])
+cluster2<- as.data.frame(markers_up[[2]])
+cluster3<- as.data.frame(markers_up[[3]])
+cluster4<- as.data.frame(markers_up[[4]])
+cluster5<- as.data.frame(markers_up[[5]])
+cluster6<- as.data.frame(markers_up[[6]])
+cluster7<- as.data.frame(markers_up[[7]])
+cluster8<- as.data.frame(markers_up[[8]])
+cluster9<- as.data.frame(markers_up[[9]])
+cluster10<- as.data.frame(markers_up[[10]])
+cluster11<- as.data.frame(markers_up[[11]])
+cluster12<- as.data.frame(markers_up[[12]])
+```
+
+## heatmap of interesting genes
+```{r}
+#heatmap
+chosen <- c('FOS', 'JUNB','JUN', 'CCL4L2', 'NFKBIA',  'CCL3L1',  'ZFP36', 'IL32', 'CD3G', 'CD27', 'CCL3', 'CCL4L2',  'CD3D', 'IL7R', 'KLRC2', 'KLRC1', 'CCL5', 'GZMK', 'PRF1', 'GZMB', 'S100A4', 'S100A6', 'ACTB', 'PFN1', 'GZMA', 'ACTG1','SELL', 'CD34', 'XCL1', 'CCL4', 'XCL2', 'CXCR6', 'FGFBP2', 'FCGR3A', 'NKG7', 'CD74', 'HLA-DRA', 'HLA-DRB1', 'LILRA4', 'IFIT3', 'SIGLEC7', 'IFIT2', 'PMAIP1', 'CD69', 'MKI67', 'LYZ')
+
+#complete heatmap of top 5 most differentially expressed genes, Z-score
+df <- plotDots(rescaled.Yang, features=unique(unlist(chosen)), group='label')
+df <- df$data[,c(1,2,4)]
+df <- dcast(df,Feature ~Group,  value.var='Average')
+row.names(df) <- df$Feature
+df <- df[,-1]
+
+p=pheatmap(df, scale="row", cluster_cols=TRUE, cluster_rows = TRUE, cellwidth=7, cellheight = 7, fontsize_row=7, fontsize_col=7)
+
+ggsave("yangheatmap.tiff",plot = p,device = NULL,path = NULL,scale = 1,width = 6.5,height =10 , units = c("in", "cm", "mm", "px"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL)
+```
+
+## assign reflabel
+```{r}
+se.aggregated <- sumCountsAcrossCells(rescaled.Yang, id=rescaled.Yang$label)
+ref <- BlueprintEncodeData()
+pred.fine <- SingleR(test=se.aggregated, ref=ref, labels=ref$label.fine,assay.type.test="sum")
+tab <- table(Assigned=pred.fine$pruned.labels, Cluster=se.aggregated$ids)
+
+# Adding a pseudo-count of 10 to avoid strong color jumps with just 1 cell.
+pheatmap(log2(tab+10), color=colorRampPalette(c("white", "blue"))(101))
+```
+
+
+## cluster distribution over samples
+```{r}
+table(rescaled.Yang$label, rescaled.Yang$Sample)
+```
+
+
+## Save object
+```{r}
+saveRDS(rescaled.Yang, 'rescaled.Yang.rds')
+```
+
+
+## KIR expression
+We are going to use the log norm counts of the uncorrected dataset (Yang filtered), but the clusters from the corrected dataset (rescaled.Yang)
+```{r}
+Yang_filtered <- readRDS("Yang_filtered.rds")
+Yang_filtered$label <- rescaled.Yang$label
+
+
+#find KIR genes
+kirs <- grep("^KIR", rownames(Yang_filtered))
+rownames(Yang_filtered)[kirs]
+
+kirs <- c("KIR2DL1", "KIR3DL2", "KIR2DL3", "KIR3DL1", "KIR3DL3") #KIR2DL4 excluded = activating KIR
+
+#detection_limit=0, based on the logcounts matrix
+Yang_filtered <- addPerCellQC(Yang_filtered, subsets=list(KIRS=kirs), exprs_values='logcounts', detection_limit=0)
+plotReducedDim(Yang_filtered, dimred="UMAP", colour_by="subsets_KIRS_detected", text_by="label")
+plotColData(Yang_filtered, y="subsets_KIRS_detected", x='label', colour_by = 'label')
+
+#data for bargraph with # of KIRs
+kirs_detected <- plotColData(Yang_filtered[, Yang_filtered$Donor == '8'], y="subsets_KIRS_detected", x='label', colour_by = 'label')+facet_wrap(~Yang_filtered$Donor)
+kirs_detected <- kirs_detected$data
+colnames(kirs_detected) <- c('nrKIRS', "label", "label")
+kirs_detected <- kirs_detected[,c(1,2)]
+kirs_detected <- table(kirs_detected)
+kirs_detected <- prop.table(kirs_detected, margin=2)*100
+
+barplot(kirs_detected, main="nKIRS detected",xlab="label")
+
+#data for bargraph with inhibitory receptors
+p<-plotDots(Yang_filtered, features=c("KIR2DL1", "KIR3DL2", "KIR2DL3", "KIR3DL1", "KIR3DL3", "KLRC1"), group='label')+geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5)
+p$data
+
+#data for violin plot relation #KIR and NKG2A
+Yang_filtered$subsets_KIRS_detected <- as.factor(Yang_filtered$subsets_KIRS_detected)
+plotExpression(Yang_filtered[, Yang_filtered$label%in%c(1)], features="KLRC1", x="subsets_KIRS_detected", colour_by="subset")+ theme(text = element_text(size = 15),axis.text=element_text(size=13))
+ggsave("nkg2a_KIR.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 4, units = c("in", "cm", "mm", "px"),dpi =300,limitsize = TRUE,bg = NULL,)
+
+#check how many cells express NKG2A in relation to # of KIRS detected
+p<-plotDots(Yang_filtered[,Yang_filtered$label%in%c('1')], features=c("KLRC1"), group='subsets_KIRS_detected')
+p$data
+
+
+
+```
+
+
+
+## add label and umap to Yang_filtered dataset
+
+```{r}
+Yang_filtered$label <- rescaled.Yang$label
+reducedDim(Yang_filtered, 'UMAP') <- reducedDim(rescaled.Yang, 'UMAP')
+
+saveRDS(Yang_filtered, 'Yang_filtered.rds')
+```
+

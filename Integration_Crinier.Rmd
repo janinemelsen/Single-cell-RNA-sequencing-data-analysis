@@ -1,0 +1,226 @@
+---
+title: "Crinier integration"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE, error=FALSE}
+library(scater)
+library(scran)
+library(SingleCellExperiment)
+library(EnsDb.Hsapiens.v86)
+library(batchelor)
+library(BiocNeighbors)
+library(BiocParallel)
+library(SingleR)
+library(DropletUtils)
+library(reshape2)
+```
+
+## Import dataset
+```{r}
+Crinier_unfiltered<- read10xCounts('P:/kjc/Immlab/janineM/Vivier/AGGHD3/outs/filtered_feature_bc_matrix.h5', type="HDF5")
+
+Crinier_unfiltered$Donor <- gsub(pattern=".+-", replacement="", Crinier_unfiltered$Barcode)
+
+rowData(Crinier_unfiltered)$Chr <- mapIds(EnsDb.Hsapiens.v86, keys=rownames(Crinier_unfiltered),
+    column="SEQNAME", keytype="GENEID")
+
+rownames(Crinier_unfiltered) <- uniquifyFeatureNames(rowData(Crinier_unfiltered)$ID,
+    names = rowData(Crinier_unfiltered)$Symbol)
+```
+
+
+## Quality control
+```{r fig.height=3, fig.width=20}
+# add mitodata
+mito <- grep("^MT", rowData(Crinier_unfiltered)$Symbol)
+Crinier_unfiltered <- addPerCellQC(Crinier_unfiltered, subsets=list(Mito=mito))
+
+# add ribodata
+ribo <- grep("^RP[SL]", rowData(Crinier_unfiltered)$Symbol)
+Crinier_unfiltered <- addPerCellQC(Crinier_unfiltered, subsets=list(Ribo=ribo))
+
+df <- colData(Crinier_unfiltered)
+qc.ribo <- df$subsets_Ribo_percent < 10
+qc.nCount_RNA <- isOutlier(Crinier_unfiltered$sum, log=TRUE, type="both", batch=Crinier_unfiltered$donor, nmads=3)
+attr(qc.nCount_RNA , "thresholds")
+
+qc.mito <- isOutlier(Crinier_unfiltered$subsets_Mito_percent, log=FALSE, type="higher", batch=Crinier_unfiltered$donor, nmads=3)
+
+discard <-  qc.ribo | qc.nCount_RNA | qc.mito
+Crinier_unfiltered$discard <- discard
+
+
+# generate plots to highlight discarded cells
+gridExtra::grid.arrange(
+    plotColData(Crinier_unfiltered, x='Donor', y="sum", colour_by="discard")+ scale_y_log10() + ggtitle("Total RNA")+ylab("Total RNA"),
+    plotColData(Crinier_unfiltered, x='Donor', y="detected", colour_by="discard") + scale_y_log10() + ggtitle("Total genes") +ylab("Total genes"),
+    plotColData(Crinier_unfiltered,x='Donor', y="subsets_Mito_percent", colour_by="discard") + ggtitle("% Mito")+ylab("% Mito"),
+    plotColData(Crinier_unfiltered,'Donor', y="subsets_Ribo_percent", colour_by="discard") + ggtitle("% Ribo")+ylab("% Mito"),
+    ncol=4
+)
+
+plotColData(Crinier_unfiltered, x="sum", y="detected", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+ylab("total RNA")+xlab("Genes")
+
+plotColData(Crinier_unfiltered, x="sum", y="subsets_Mito_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+xlab("total RNA")+ylab("% mito")
+
+plotColData(Crinier_unfiltered, x="sum", y="subsets_Ribo_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+xlab("total RNA")+ylab("% ribo")
+
+
+#remove discarded cells
+Crinier_filtered <- Crinier_unfiltered[,!Crinier_unfiltered$discard]
+```
+
+## Normalization, log transformation
+```{r message=FALSE, echo=FALSE, error=FALSE}
+set.seed(1000)
+clusters <- quickCluster(Crinier_filtered, BPPARAM=SnowParam(workers=4), block=Crinier_filtered$Donor)
+table(clusters)
+
+#add deconv factor to sce
+Crinier_filtered <- computeSumFactors(Crinier_filtered, clusters=clusters, BPPARAM=SnowParam(workers=19))
+
+
+#We then compute log-normalized expression values for downstream use.
+Crinier_filtered <- logNormCounts(Crinier_filtered)
+```
+
+
+## save object
+```{r}
+saveRDS(Crinier_filtered,'Crinier_filtered.rds')
+```
+
+
+## Data integration (with correction for sequencing depth)
+```{r message=FALSE, error=FALSE}
+# correction for sequencing depth (recalculation of size factors)
+rescaled.Crinier <- multiBatchNorm(Crinier_filtered, batch = Crinier_filtered$Donor, BPPARAM=SnowParam(workers=19))
+
+#variable genes
+dec<- modelGeneVar(rescaled.Crinier, block=rescaled.Crinier$Donor, BPPARAM=SnowParam(workers=19))
+hvg.sce.var <- getTopHVGs(dec, n=2000)
+
+set.seed(1000101001)
+
+#try to improve integration by increasing k (standard =20)
+merged.corrected.Crinier <- fastMNN(rescaled.Crinier, batch=rescaled.Crinier$Donor, d=50, k=20, subset.row=hvg.sce.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.Crinier,'MNN') <- reducedDim(merged.corrected.Crinier, 'corrected')
+```
+## Dimensionality reduction
+```{r}
+set.seed(01010100)
+rescaled.Crinier <- runUMAP(rescaled.Crinier, dimred="MNN",
+    external_neighbors=TRUE, 
+    n_neighbors=30,
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.6,
+    name='UMAP'
+    )
+```
+
+## clustering
+Graph-based clustering generates an excessively large intermediate graph so we will instead use a two-step approach with k-means. We generate 8000 small clusters that are subsequently aggregated into more interpretable groups with a graph-based method.
+```{r}
+#either use kmeans clustering to speed up the process
+clust.Crinier <- clusterSNNGraph(rescaled.Crinier, use.dimred="MNN", 
+    use.kmeans=TRUE, kmeans.centers=8000, clusterFUN=igraph::cluster_walktrap)
+
+# we choose kmeans clustering based on SNN graph
+colLabels(rescaled.Crinier) <- factor(clust.Crinier)
+table(colLabels(rescaled.Crinier))
+table(Cluster=clust.Crinier, Batch=rescaled.Crinier$Donor)
+
+```
+`
+## Visualization
+```{r}
+plotUMAP(rescaled.Crinier, colour_by='label', text_by='label') +
+scale_color_manual(values = c('1'='#ff9e4a','2'= '#ed97ca','3'= "#729ece",'4'="#ad8bc9", '5'="#2ca02c", '6'= '#e377c2', '7'= '#C49C49','8'="#67bf5c", '9'= '#a8786e', '10'='#17becf',  '11' ='#ed665d', '12'= '#DBDB8D'),aesthetics = "fill")
+
+
+ggsave("Cinier_cluster.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 5,height = 4, dpi =300,limitsize = TRUE,bg = NULL,)
+
+plotUMAP(rescaled.Crinier, colour_by='Donor', text_by='Donor')
+plotUMAP(rescaled.Crinier, colour_by='IL7R', text_by='Donor')
+
+```
+
+## upregulated markers
+```{r}
+markers_up<- findMarkers(rescaled.Crinier, test="wilcox", direction='up')
+cluster1<-as.data.frame(markers_up[[1]])
+cluster2<- as.data.frame(markers_up[[2]])
+cluster3<- as.data.frame(markers_up[[3]])
+cluster4<- as.data.frame(markers_up[[4]])
+cluster5<- as.data.frame(markers_up[[5]])
+cluster6<- as.data.frame(markers_up[[6]])
+cluster7<- as.data.frame(markers_up[[7]])
+cluster8<- as.data.frame(markers_up[[8]])
+cluster9<- as.data.frame(markers_up[[9]])
+cluster10<- as.data.frame(markers_up[[10]])
+cluster11<- as.data.frame(markers_up[[11]])
+cluster12<- as.data.frame(markers_up[[12]])
+```
+
+## heatmap of interesting genes
+```{r}
+#heatmap
+chosen <- c('FOS', 'JUNB','JUN', 'CCL4L2', 'NFKBIA',  'CCL3L1',  'ZFP36', 'IL32', 'CD27', 'CCL3', 'CCL4L2', 'IL7R', 'KLRC1', 'CCL5', 'GZMK', 'PRF1', 'GZMB', 'GZMA','SELL', 'LYZ', 'XCL1', 'CCL4', 'XCL2', 'CXCR6', 'FGFBP2', 'FCGR3A', 'NKG7', 'CD74', 'HLA-DRA', 'HLA-DRB1', 'IFIT3', 'SIGLEC7', 'PMAIP1', 'CD69', 'MKI67', 'HBB', 'HBD')
+
+#complete heatmap of top 5 most differentially expressed genes, Z-score
+df <- plotDots(rescaled.Crinier, features=unique(unlist(chosen)), group='label')
+df <- df$data[,c(1,2,4)]
+df <- dcast(df,Feature ~Group,  value.var='Average')
+row.names(df) <- df$Feature
+df <- df[,-1]
+
+p=pheatmap(df, scale="row", cluster_cols=TRUE, cluster_rows = TRUE, cellwidth=7, cellheight = 7, fontsize_row=7, fontsize_col=7)
+
+ggsave("Crinierheatmap.tiff",plot = p,device = NULL,path = NULL,scale = 1,width = 6.5,height =10 , units = c("in", "cm", "mm", "px"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL)
+```
+
+
+## cluster distribution over samples
+```{r}
+table(rescaled.Crinier$label, rescaled.Crinier$Donor)
+```
+
+
+## Save object
+```{r}
+saveRDS(rescaled.Crinier, 'rescaled.Crinier.rds')
+```
+
+
+## assign reflabel
+```{r}
+se.aggregated <- sumCountsAcrossCells(rescaled.Crinier, id=rescaled.Crinier$label)
+ref <- BlueprintEncodeData()
+pred.fine <- SingleR(test=se.aggregated, ref=ref, labels=ref$label.fine,assay.type.test="sum")
+tab <- table(Assigned=pred.fine$pruned.labels, Cluster=se.aggregated$ids)
+
+# Adding a pseudo-count of 10 to avoid strong color jumps with just 1 cell.
+pheatmap(log2(tab+10), color=colorRampPalette(c("white", "blue"))(101))
+```
+
+
+
+## add clusterlabel and UMAP settings to Crinier_filtered dataset 
+```{r}
+Crinier_filtered$label <- rescaled.Crinier$label
+reducedDim(Crinier_filtered, 'UMAP') <- reducedDim(rescaled.Crinier, 'UMAP')
+
+saveRDS(Crinier_filtered, 'Crinier_filtered.rds')
+```
+
+
