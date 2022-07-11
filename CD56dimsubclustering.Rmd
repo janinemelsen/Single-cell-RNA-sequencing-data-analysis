@@ -43,7 +43,7 @@ sce.dim <- runUMAP(sce.dim, dimred="PCA_30", n_neighbors=20, min_dist=0.1, name=
 plotReducedDim(sce.dim,dimred="UMAP", colour_by ="sublabel", point_size=2, text_by = 'sublabel')+ theme(text = element_text(size = 13), axis.text=element_text(size=13)) +
 scale_color_manual(values = c('1' = "#A0CBE8", '2' = "#D37295", '3' = "#8CD17D", '4'='#F1CE63', '5'='#79706E', '6'='#499894'),aesthetics = "fill")
 
-plotReducedDim(sce.dim,dimred="UMAP", colour_by ="CXCR4", point_size=2, text_by = 'sublabel')+ theme(text = element_text(size = 15), axis.text=element_text(size=15))
+plotReducedDim(sce.dim,dimred="UMAP", colour_by ="KLRB1", point_size=2, text_by = 'sublabel')+ theme(text = element_text(size = 15), axis.text=element_text(size=15))
 
 
 ggsave("KLRB1.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 5,
