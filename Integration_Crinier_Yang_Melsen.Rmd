@@ -346,7 +346,7 @@ row.names(p2) <- p2$Feature
 p2 <- p2[,-1]
 pheatmap(p2, scale="row", cluster_cols=FALSE, cluster_rows = TRUE, cellwidth=7, cellheight = 7, fontsize_row=7, fontsize_col=7)
 
-saveRDS(rescaled.NK_merged.ltnk, "merged_dimgzmkplus.rds")
+saveRDS(rescaled.NK_merged.dimgzmkplus, "merged_dimgzmkplus.rds")
 
 
 ```
