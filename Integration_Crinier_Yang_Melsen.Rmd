@@ -325,7 +325,7 @@ plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="FGFBP2"
 plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="CCL5", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
 plotReducedDim(rescaled.NK_merged.dimgzmkplus,dimred="UMAP", colour_by ="subsets_Ribo_percent", point_size=4, text_by = 'label')+theme(text = element_text(size = 17), axis.text=element_text(size=15))
 
-ggsave("ribo_merged_dimkpluis.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 5,dpi = 300,limitsize = TRUE,bg = NULL,)
+ggsave("ribo_merged_dimkplus.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 5,dpi = 300,limitsize = TRUE,bg = NULL,)
 
 
 markers<- findMarkers(rescaled.NK_merged.dimgzmkplus, test="wilcox", groups=rescaled.NK_merged.dimgzmkplus$label)
