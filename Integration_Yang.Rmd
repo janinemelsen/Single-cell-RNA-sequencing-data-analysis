@@ -281,7 +281,54 @@ p$data
 
 ```
 
+## KIR expression per individual donor (use Yang_filtered, log normalized, but not corrected for sequencing depth)
+```{r}
+# select CD56dimgzmk- cells in Yang_filtered object
+Yang_filtered$label <- rescaled.Yang$label
+Yang_filtered <- Yang_filtered[, rescaled.Yang$label %in% c('2', '8', '9', '14', '15', '16', '12')]
 
+#split sce function
+splitColData <- function(x, f) {
+  i <- split(seq_along(f), f)
+  v <- vector(mode = "list", length = length(i))
+  names(v) <- names(i)
+  for (n in names(i)) { v[[n]] <- x[, i[[n]]] }
+  return(v)
+}
+
+Yang_list <- splitColData(Yang_filtered, Yang_filtered$Donor)
+
+# Taking the top 2000 genes:
+dec <- lapply(Yang_list, function(x) modelGeneVar(x))
+hvg.sce.var <- lapply(dec, function(x) getTopHVGs(x, n=2000))
+
+set.seed(100) # See below.
+#PCA UMAP clustering
+for (i in 1:length(Yang_list)){
+  Yang_list[[i]] <- runPCA(Yang_list[[i]], subset_row=hvg.sce.var[[i]], name="PCA")
+  percent.var <- attr(reducedDim(Yang_list[[i]], 'PCA'), "percentVar")
+  reducedDim(Yang_list[[i]], "PCA_20") <- reducedDim(Yang_list[[i]], "PCA")[,1:20]
+  Yang_list[[i]] <- runUMAP(Yang_list[[i]], dimred="PCA_20", n_neighbors=30, min_dist=0.6)
+  g.major <- buildSNNGraph(Yang_list[[i]], k=30, use.dimred = 'PCA_20')
+  clust.major <- igraph::cluster_louvain(g.major)$membership
+ Yang_list[[i]]$major <- factor(clust.major)
+  g.minor <- buildSNNGraph(Yang_list[[i]], k=10, use.dimred = 'PCA_20')
+  clust.minor <- igraph::cluster_louvain(g.minor)$membership
+  Yang_list[[i]]$minor <- factor(clust.minor)
+}
+
+
+# visualization
+for (i in 1:length(kirs)){
+  p=plotReducedDim(Yang_list[[1]], "UMAP", text_by='minor', colour_by=kirs[[i]], size_by=kirs[[i]])+theme(text = element_text(size = 17), axis.text=element_text(size=17),legend.key.size = unit(1, 'cm'),legend.key.height = unit(1, 'cm'),legend.key.width = unit(1, 'cm'), legend.title = element_text(size=14), legend.text = element_text(size=25))
+  print(p)
+}
+
+plotReducedDim(Yang_list[[1]], "UMAP", text_by='minor', colour_by='KIR3DL1', size_by='KIR3DL1')+theme(text = element_text(size = 17), axis.text=element_text(size=17),legend.key.size = unit(1, 'cm'),legend.key.height = unit(1, 'cm'),legend.key.width = unit(1, 'cm'), legend.title = element_text(size=14), legend.text = element_text(size=25))
+
+plotReducedDim(Yang_list[[8]], "UMAP", text_by='minor', colour_by='KIR3DL1', size_by='KIR3DL1')+theme(text = element_text(size = 17), axis.text=element_text(size=17),legend.key.size = unit(1, 'cm'),legend.key.height = unit(1, 'cm'),legend.key.width = unit(1, 'cm'), legend.title = element_text(size=14), legend.text = element_text(size=25))
+
+```
 
 ## add label and umap to Yang_filtered dataset
 
