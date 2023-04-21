@@ -28,7 +28,7 @@ Yang: [GSE130430](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE130430)
 
 
 ## Sce objects
-Click here to open the sce objects, as generated in the paper (big integrated objects were excluded). 
+Click [here](https://github.com/janinemelsen/Single-cell-RNA-sequencing-data-analysis/tree/main/sce%20objects) to open the sce objects, as generated in the paper (big integrated objects were excluded). 
 The objects with 'sce' in title, refer to the Melsen dataset
 
 
