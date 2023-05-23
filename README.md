@@ -1,5 +1,5 @@
 # Single-cell-RNA-sequencing-data-analysis
-R code for the analysis of single-cell RNA sequencing analysis of human natural killer cells as published in....
+R code for the analysis of single-cell RNA sequencing analysis of human natural killer cells as published in [Frontiers in Immunology](https://www.frontiersin.org/articles/10.3389/fimmu.2022.1044398/full)
 
 ## Datasets
 Melsen: [GSE199411](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE199411)
