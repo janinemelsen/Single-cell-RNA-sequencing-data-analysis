@@ -1,0 +1,221 @@
+---
+title: "integration HCA"
+author: "Janine Melsen"
+date: "03/06/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE, error=FALSE}
+library(scater)
+library(scran)
+library(SingleCellExperiment)
+library(HCAData)
+library(EnsDb.Hsapiens.v86)
+library(batchelor)
+library(BiocNeighbors)
+library(BiocParallel)
+library(SingleR)
+library(DropletUtils)
+library(SingleR)
+library(pheatmap)
+```
+
+## Read HCA data
+```{r}
+sce.bone_unfiltered<- read10xCounts('P:/kjc/Immlab/janineM/Humanatlas_bonemarrow/ica_bone_marrow_h5.h5', type="HDF5")
+sce.bone_unfiltered <- HCAData('ica_bone_marrow')
+sce.bone_unfiltered$Donor <- sub("_.*","", sce.bone_unfiltered$Barcode)
+sce.bone_unfiltered$Donor <- gsub("Manton", "", sce.bone_unfiltered$Donor)
+
+rowData(sce.bone_unfiltered)$Chr <- mapIds(EnsDb.Hsapiens.v86, keys=rownames(sce.bone_unfiltered),
+    column="SEQNAME", keytype="GENEID")
+
+rownames(sce.bone_unfiltered) <- uniquifyFeatureNames(rowData(sce.bone_unfiltered)$ID,
+    names = rowData(sce.bone_unfiltered)$Symbol)
+```
+
+## Quality control
+```{r}
+# add mitodata
+mito <- grep("^MT", rowData(sce.bone_unfiltered)$Symbol)
+sce.bone_unfiltered <- addPerCellQC(sce.bone_unfiltered, subsets=list(Mito=mito))
+colData(sce.bone_unfiltered)[, 1:5]
+
+sce.bone_unfiltered <- addPerFeatureQC(sce.bone_unfiltered)
+rowData(sce.bone_unfiltered)
+
+# add ribodata
+ribo <- grep("^RP[SL]", rowData(sce.bone_unfiltered)$Symbol)
+sce.bone_unfiltered <- addPerCellQC(sce.bone_unfiltered, subsets=list(Ribo=ribo))
+colData(sce.bone_unfiltered)
+
+
+# define discard cells based on lib_size, #genes, %mito,  block donor effect
+qc <- quickPerCellQC(colData(sce.bone_unfiltered), batch=sce.bone_unfiltered$Donor,
+    percent_subset="subsets_Mito_percent")
+colSums(as.matrix(qc))
+sce.bone_unfiltered$discard <- qc$discard
+
+# generate plots to highlight discarded cells
+gridExtra::grid.arrange(
+    plotColData(sce.bone_unfiltered, x='Donor', y="sum", colour_by="discard")+ scale_y_log10() + ggtitle("Total RNA")+ylab("Total RNA"),
+    plotColData(sce.bone_unfiltered, x='Donor', y="detected", colour_by="discard") + scale_y_log10() + ggtitle("Total genes") +ylab("Total genes"),
+    plotColData(sce.bone_unfiltered,x='Donor', y="subsets_Mito_percent", colour_by="discard") + ggtitle("% Mito")+ylab("% Mito"),
+    ncol=3
+)
+
+plotColData(sce.bone_unfiltered, x="sum", y="detected", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+scale_y_continuous(breaks = c(0, 1000, 2500, 5000, 7500, 8300, 10000), limits = c(0, 10000))+geom_hline(yintercept = c(8300,1000), linetype='dashed')+ylab("total RNA")+xlab("Genes")
+
+plotColData(sce.bone_unfiltered, x="sum", y="subsets_Mito_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+geom_hline(yintercept = 12.5, linetype = 'dashed')+scale_y_continuous(breaks = c(0, 12.5, 25, 50, 75, 100))+xlab("total RNA")+ylab("% mito")
+
+plotColData(sce.bone_unfiltered, x="sum", y="subsets_Ribo_percent", colour_by="discard") +theme(panel.border = element_rect(color = "grey"))+theme_bw()+xlab("total RNA")+ylab("% ribo")
+
+
+#remove discarded cells
+sce.bone <- sce.bone_unfiltered[,!sce.bone_unfiltered$discard]
+
+```
+
+## log transformation, normalization by deconvolution 
+```{r}
+set.seed(1000)
+clusters <- quickCluster(sce.bone, BPPARAM=SnowParam(workers=4), block=sce.bone$Donor)
+table(clusters)
+
+#add deconv factor to sce
+sce.bone <- computeSumFactors(sce.bone, clusters=clusters, BPPARAM=SnowParam(workers=19))
+
+#We then compute log-normalized expression values for downstream use. This data set does not contain spike-in transcripts so separate normalziation with computeSpikeFactors() is not required.
+sce.bone <- logNormCounts(sce.bone)
+assayNames(sce.bone)
+
+saveRDS(sce.bone, 'sce.bone.rds')
+```
+
+
+## Integrate own dataset with complete bone marrow
+```{r}
+sce <- readRDS('sce_clustered.rds')
+sce.bone <- readRDS('sce.bone.rds')
+
+colData(sce) <- colData(sce)[, c("Barcode", "sum", "Donor", "subsets_Mito_percent", "subsets_Ribo_percent", "subset")]
+sce.bone$subset <- '1'
+colData(sce.bone) <- colData(sce.bone)[, c("Barcode", "sum", "Donor", "subsets_Mito_percent", "subsets_Ribo_percent", "subset")]
+
+reducedDims(sce) <- NULL
+altExps(sce) <- NULL
+reducedDims(sce.bone) <- NULL
+#int_colData(sce.bone)$size_factor <- NULL
+rowData(sce) <- NULL
+rowData(sce.bone) <- NULL
+
+universe <- intersect(rownames(sce), rownames(sce.bone))
+sce <- sce[universe,]
+sce.bone <- sce.bone[universe,]
+uncorrected <- cbind(sce, sce.bone, deparse.level=1)
+
+
+#correction for sequencing depth
+rescaled.totalBM <- multiBatchNorm(uncorrected, batch = uncorrected$Donor, BPPARAM=SnowParam(workers=18))
+
+#variable genes
+dec<- modelGeneVar(rescaled.totalBM, block=rescaled.totalBM$Donor, BPPARAM=SnowParam(workers=19))
+hvg.sce.var <- getTopHVGs(dec, n=2000)
+
+set.seed(1000101001)
+
+merged.corrected.totalBM <- fastMNN(rescaled.totalBM, batch=rescaled.totalBM$Donor, d=50, k=20, subset.row=hvg.sce.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(rescaled.totalBM,'MNN') <- reducedDim(merged.corrected.totalBM, 'corrected')
+
+#clustering
+clust.bone <- clusterSNNGraph(rescaled.totalBM, use.dimred="MNN", 
+    use.kmeans=TRUE, kmeans.centers=10000, clusterFUN=igraph::cluster_walktrap)
+rescaled.totalBM$cluster<- factor(clust.bone)
+
+#UMAP
+set.seed(110011001)
+
+rescaled.totalBM <- runUMAP(rescaled.totalBM, dimred="MNN",
+    external_neighbors=TRUE, 
+    n_neighbors=30,
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(workers=19),
+    n_threads=bpnworkers(SnowParam(workers=19)),
+    min_dist=0.4)
+
+plotReducedDim(rescaled.totalBM, dimred="UMAP", colour_by ="cluster", text_by = 'cluster')+ theme(text = element_text(size = 15), axis.text=element_text(size=15))
+plotReducedDim(rescaled.totalBM[, rescaled.totalBM$Donor=='BMKJC'], dimred="UMAP", colour_by ="subset")+ theme(text = element_text(size = 15), axis.text=element_text(size=15))+xlim(-10.268,15.107)+ylim(-13.8857,13.8296)
+
+plotReducedDim(rescaled.totalBM[, rescaled.totalBM$Donor=='BMKJC'], dimred="UMAP", colour_by ="cluster", text_by='cluster')+ theme(text = element_text(size = 15), axis.text=element_text(size=15))+xlim(-10.268,15.107)+ylim(-13.8857,13.8296)
+
+ggsave("KJC_cluster_number.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 4,dpi =300,limitsize = TRUE,bg = NULL,)
+
+#assign reflabel
+se.aggregated <- sumCountsAcrossCells(rescaled.totalBM, id=rescaled.totalBM$cluster)
+ref <- BlueprintEncodeData()
+pred.fine <- SingleR(test=se.aggregated, ref=ref, labels=ref$label.fine,assay.type.test="sum")
+tab <- table(Assigned=pred.fine$pruned.labels, Cluster=se.aggregated$ids)
+
+
+# Adding a pseudo-count of 10 to avoid strong color jumps with just 1 cell.
+pheatmap(log2(tab+10), color=colorRampPalette(c("white", "blue"))(101))
+
+saveRDS(rescaled.totalBM, "rescaled.totalBM.rds")
+
+```
+
+## subset Progenitors and NK cells
+
+```{r}
+#subset cluster 6,18,24,28,29 (progenitors) and cluster 3,30 (NK cells)
+subsets <- rescaled.totalBM[,rescaled.totalBM$cluster%in% c(6,18,24,28,29,3,30)]
+
+dec<- modelGeneVar(subsets, block=subsets$Donor, BPPARAM=SnowParam(workers=19))
+hvg.sce.var <- getTopHVGs(dec, n=2000)
+
+merged.subsets <- fastMNN(subsets, batch=subsets$Donor, d=50, k=20, subset.row=hvg.sce.var,
+    BSPARAM=BiocSingular::RandomParam(deferred=TRUE),
+    BNPARAM=AnnoyParam(),
+    BPPARAM=SnowParam(19))
+
+reducedDim(subsets,'MNN') <- reducedDim(merged.subsets, 'corrected')
+
+#clustering
+clust <- clusterSNNGraph(subsets, use.dimred="MNN", use.kmeans=TRUE, kmeans.centers=4000)
+subsets$cluster<- factor(clust)
+
+#UMAP
+subsets <- runUMAP(subsets, dimred="MNN", n_neighbors=30, min_dist=0.6, name="UMAP")
+
+
+plotReducedDim(subsets, dimred="UMAP", colour_by ="cluster", text_by = 'cluster')+ theme(text = element_text(size = 15), axis.text=element_text(size=15))
+ggsave("HCA_KJC_prog.tiff",plot = last_plot(),device = NULL,path = NULL,scale = 1,width = 6,height = 4, dpi =300,limitsize = TRUE,bg = NULL,)
+plotReducedDim(subsets[, subsets$Donor=='BMKJC'], dimred="UMAP", colour_by ="subset", text_by = 'subset')
+
+
+## assign reflabel
+se.aggregated <- sumCountsAcrossCells(subsets, id=subsets$cluster)
+ref <- BlueprintEncodeData()
+pred.fine <- SingleR(test=se.aggregated, ref=ref, labels=ref$label.fine,assay.type.test="sum")
+tab <- table(Assigned=pred.fine$pruned.labels, Cluster=se.aggregated$ids)
+
+# Adding a pseudo-count of 10 to avoid strong color jumps with just 1 cell.
+pheatmap(log2(tab+10), color=colorRampPalette(c("white", "blue"))(101))
+
+
+# Dotplots (NK progenitor was described as CD34+CD38+CD123−CD45RA+CD7+CD10+CD127− cells)
+
+genelist = c("CD34", "CD38", "IL3RA", "CD7", "MME", "IL7R", "KLRF1", "KLRD1")
+clusterlist = c('28', '18', '19', '10', '31', '16', '12', '7', '14', '22', '13', '1', '9', '5', '25', '24', '30', '2', '3', '32', '20', '26', '23', '17', '6', '4', '15', '34', '29', '8', '11', '27', '33', '21')
+
+plotDots(subsets, features=c("CD34", "CD38", "IL3RA", "CD7", "MME", "IL7R", "KLRF1", "KLRD1"), group='cluster')+scale_y_discrete(limits=rev(genelist))+scale_x_discrete(limits=(clusterlist))
+
+saveRDS(subsets, "subsets.rds")
+```
+
+
+
